@@ -8,9 +8,7 @@
 #include "server_api.h"
 #include "secrets.h"
 
-// Bump this with every build you push to the server's /firmware/meta.
-// Simplest approach: a date-ish string, e.g. "2026.07.03-1".
-#define FIRMWARE_VERSION "Beta2"
+
 
 static bool fetchMeta(String& outVersion, size_t& outSize, String& outMd5) {
   WiFiClient client;
@@ -114,9 +112,9 @@ static bool downloadAndFlash(size_t expectedSize, const String& expectedMd5) {
         }
         written += w;
 
-        if (millis() - lastProgressLog > 500) {
+        if (millis() - lastProgressLog > 150) {
           lastProgressLog = millis();
-          otaLogPrintf("OTA %d%%", (int)(100 * written / expectedSize));
+          otaLogProgress((int)(100 * written / expectedSize));
         }
       }
     } else {

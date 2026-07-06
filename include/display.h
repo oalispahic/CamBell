@@ -1,7 +1,7 @@
 #pragma once
 #include <Arduino.h>
 
-enum DisplayMode { MODE_BOOT_LOG, MODE_TEMP, MODE_PIC };
+enum DisplayMode { MODE_BOOT_LOG, MODE_DASHBOARD };
 
 extern DisplayMode displayMode;
 extern bool oled_ready;
@@ -9,10 +9,13 @@ extern bool oled_ready;
 void initDisplay();
 void logMsg(const char* msg);
 void logMsgf(const char* fmt, ...);
-void enterTempScreen();
-void updateTempValue();
-void showPicTaken();
-void showHoldProgress(int percent);
+
+void enterDashboard();
+void updateDashboard();
+void showHoldProgress(int percent, const char* label);
+
+void showFactorySetup(const char* apSsid, const char* ip);
+void showFactorySaved();
 
 // Dedicated OTA status renderer — does NOT reuse the boot-time u8log
 // widget, since u8log tracks its own cursor separately from the OLED's
@@ -21,3 +24,4 @@ void showHoldProgress(int percent);
 void otaLogBegin();
 void otaLogPrint(const char* msg);
 void otaLogPrintf(const char* fmt, ...);
+void otaLogProgress(int pct);
