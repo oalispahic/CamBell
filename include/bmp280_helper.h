@@ -1,5 +1,6 @@
 #pragma once
 
-bool bmpInit();
-bool bmpAvailable();
+bool  bmpInit();
+bool  bmpAvailable();
 float bmpReadTemperature();
+float bmpReadPressureHpa();

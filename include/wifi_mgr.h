@@ -1,4 +1,4 @@
 #pragma once
 
-void initWiFi();
+void initWiFi(const char* ssid, const char* password);
 bool isWiFiConnected();

@@ -3,21 +3,16 @@
 #include <WiFi.h>
 #include "config.h"
 #include "display.h"
-#include "secrets.h"
+// secrets.h no longer needed here — credentials are passed in
 
 static bool wifi_connected = false;
 
-void initWiFi() {
+void initWiFi(const char* ssid, const char* password) {
   WiFi.disconnect(true);
   delay(1000);
   WiFi.mode(WIFI_STA);
-  // Modem sleep left enabled (default) instead of forcing setSleep(false).
-  // The radio still wakes immediately on any outgoing request (e.g. your
-  // polling GET), it just powers down between DTIM beacon intervals when
-  // idle instead of staying fully active 24/7. Biggest lever on baseline
-  // current draw / heat for this board.
   WiFi.setTxPower(WIFI_POWER_11dBm);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.begin(ssid, password);
 
   int attempts = 0;
   while (WiFi.status() != WL_CONNECTED && attempts < 40) {
