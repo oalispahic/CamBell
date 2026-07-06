@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <WiFi.h>
 #include <Wire.h>
 #include "config.h"
 #include "display.h"
@@ -6,17 +7,26 @@
 #include "server_api.h"
 #include "bmp280_helper.h"
 #include "ota.h"
+#include "factory_mode.h"
+#include "credentials.h"
+#include "state.h"
 
-#define OTA_HOLD_MS 4000
+unsigned long lastDashboardUpdate = 0;
+unsigned long lastCommandPoll     = 0;
 
-unsigned long lastButtonPress = 0;
-unsigned long lastTempUpdate  = 0;
-unsigned long picMessageStart = 0;
-
-static bool buttonWasDown  = false;
-static unsigned long buttonDownAt = 0;
-static bool longPressFired = false;
+static bool          buttonWasDown         = false;
+static unsigned long buttonDownAt          = 0;
+static bool          longPressFired        = false;
 static unsigned long lastHoldDisplayUpdate = 0;
+static unsigned long lastReleaseAction     = 0;
+static bool          holdProgressShown     = false;
+
+// Double-click detection: on a short release we don't fire immediately —
+// we wait DOUBLE_CLICK_MS for a possible second click, and only then
+// classify. Second click within the window = double-click (photo);
+// timeout = single click (arm/disarm).
+static bool          pendingSingleClick    = false;
+static unsigned long pendingSingleClickAt  = 0;
 
 void blinkLED(int times, int duration) {
   for (int i = 0; i < times; i++) {
@@ -24,6 +34,37 @@ void blinkLED(int times, int duration) {
     delay(duration);
     digitalWrite(LED_PIN, LOW);
     delay(duration);
+  }
+}
+
+static void sendStatsToBackend() {
+  DeviceInfo info = {};
+  info.tempC               = bmpAvailable() ? bmpReadTemperature() : 0.0f;
+  info.pressureHpa         = bmpAvailable() ? bmpReadPressureHpa() : 0.0f;
+  info.voltageV            = 0.0f;   // no voltage divider wired; backend shows n/a
+  info.armed               = isArmed();
+  info.uptimeSeconds       = millis() / 1000;
+  info.hadEvent            = hadAnyEvent();
+  info.lastEventSecondsAgo = hadAnyEvent() ? (millis() - lastEventMs()) / 1000 : 0;
+  sendDeviceInfo(info);
+}
+
+static void handleTelegramCommand(const String& cmd) {
+  Serial.printf("[TG CMD] %s\n", cmd.c_str());
+
+  if (cmd == "pic") {
+    markEvent();
+    updateDashboard();          // flash "EVENT !" before we go blocking on HTTP
+    captureAndSendPhoto();
+  } else if (cmd == "arm") {
+    toggleArmed();
+    Serial.printf("[ARMED = %s]\n", isArmed() ? "yes" : "no");
+    sendBackendMessage(isArmed() ? "Now ARMED." : "Now DISARMED.");
+    if (displayMode == MODE_DASHBOARD) enterDashboard();   // refresh top-left label
+  } else if (cmd == "stats") {
+    sendStatsToBackend();
+  } else {
+    Serial.println("[TG CMD] unknown, ignoring");
   }
 }
 
@@ -36,21 +77,31 @@ void setup() {
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
 
+  // Bring the OLED up before the factory-mode check so runFactoryMode()
+  // can show the SSID + IP instead of leaving a stale screen behind.
   Wire.begin(I2C_SDA, I2C_SCL);
   Wire.setClock(400000);
   initDisplay();
+
+  if (shouldEnterFactoryMode()) {
+    runFactoryMode();   // never returns — reboots on save
+  }
+
+  Credentials creds = loadCredentials();
+  initServerApi(creds.backendApiUrl, creds.backendApiUsername, creds.backendApiPassword);
+
   bmpInit();
-  logMsg("Newer test !!!!!!!!!!!!!!!");
-  logMsg("Newer test !!!!!!!!!!!!!!!");
-  logMsg("Newer test !!!!!!!!!!!!!!!");
+  initArmedState();
+
+  logMsg("Setup starting");
+  logMsgf("Firmware v%s", FIRMWARE_VERSION);
   logMsg(oled_ready     ? "OLED: OK"   : "OLED: FAIL");
   logMsg(bmpAvailable() ? "BMP280: OK" : "BMP280: FAIL");
-  
 
   blinkLED(3, 200);
 
   logMsg("WiFi connecting");
-  initWiFi();
+  initWiFi(creds.wifiSSID.c_str(), creds.wifiPassword.c_str());
 
   logMsg("Init camera");
   initCamera();
@@ -60,8 +111,7 @@ void setup() {
     logMsg("Backend login");
     if (serverLogin()) {
       logMsg("Login OK");
-      int code = sendBackendMessage("ESP32-CAM connected and ready.");
-      logMsgf("Msg code=%d", code);
+      sendBackendMessage("ESP32-CAM online.");
     } else {
       logMsg("Login FAILED");
     }
@@ -71,88 +121,140 @@ void setup() {
   digitalWrite(LED_PIN, LOW);
 
   delay(1500);
-  displayMode = MODE_TEMP;
-  enterTempScreen();
-  lastTempUpdate = millis();
+  displayMode = MODE_DASHBOARD;
+  enterDashboard();
+  lastDashboardUpdate = millis();
+}
+
+static void runOTAFlow() {
+  Serial.println("[BUTTON HELD 5s -> OTA]");
+  blinkLED(1, 600);
+  otaLogBegin();
+  if (isWiFiConnected()) {
+    checkAndPerformOTA();   // reboots on success
+  } else {
+    otaLogPrint("OTA: no WiFi");
+  }
+  delay(1500);
+  displayMode = MODE_DASHBOARD;
+  enterDashboard();
+  lastDashboardUpdate = millis();
 }
 
 void loop() {
   bool buttonDown = (digitalRead(BUTTON_PIN) == LOW);
 
+  // ------- rising edge -------
   if (buttonDown && !buttonWasDown) {
-    // Rising edge of a press
-    buttonDownAt = millis();
+    buttonDownAt   = millis();
     longPressFired = false;
   }
 
+  // ------- while held -------
   if (buttonDown && !longPressFired) {
-    // Update the on-screen progress bar a few times a second while held,
-    // rather than every 50ms loop tick (avoids hammering the I2C bus).
-    if (millis() - lastHoldDisplayUpdate > 150) {
+    unsigned long elapsed = millis() - buttonDownAt;
+
+    // Only start drawing the hold-progress screen after 3s, so brief clicks
+    // don't visibly flash over the dashboard.
+    if (elapsed >= BUTTON_HOLD_DISPLAY_MS &&
+        millis() - lastHoldDisplayUpdate > 150) {
       lastHoldDisplayUpdate = millis();
-      int elapsed = (int)(millis() - buttonDownAt);
-      int percent = (elapsed * 100) / OTA_HOLD_MS;
-      showHoldProgress(percent);
+      holdProgressShown = true;
+
+      // Rescale 3s..10s -> 0..100% so the bar visibly moves.
+      unsigned long span = BUTTON_FACTORY_MS - BUTTON_HOLD_DISPLAY_MS;
+      int pct = (int)((elapsed - BUTTON_HOLD_DISPLAY_MS) * 100 / span);
+      const char* label;
+      if (elapsed < BUTTON_OTA_MS)          label = "Hold 5s: OTA";
+      else if (elapsed < BUTTON_FACTORY_MS) label = "Release: OTA";
+      else                                  label = "Release: RESET";
+      showHoldProgress(pct, label);
+    }
+
+    // 10s reached — reboot into setup mode. Doesn't return.
+    if (elapsed >= BUTTON_FACTORY_MS) {
+      longPressFired = true;
+      Serial.println("[BUTTON HELD 10s -> FACTORY]");
+      triggerFactoryReset();   // reboots
     }
   }
 
-  if (buttonDown && !longPressFired && millis() - buttonDownAt >= OTA_HOLD_MS) {
-    // Held past the threshold — fire OTA immediately, don't wait for release
-    longPressFired = true;
-    Serial.println("\n[BUTTON HELD 4s -> OTA]");
-    blinkLED(1, 600);  // long single blink = distinct from short-press feedback
+  // ------- release -------
+  if (!buttonDown && buttonWasDown) {
+    unsigned long elapsed = millis() - buttonDownAt;
+    bool wasFired = longPressFired;
+    longPressFired = false;
 
-    // Dedicated OTA screen — doesn't touch displayMode or u8log at all,
-    // so there's nothing for it to desync with the temp/pic screens.
-    otaLogBegin();
-
-    if (isWiFiConnected()) {
-      checkAndPerformOTA();  // reboots on success; returns here on failure/no-update
-    } else {
-      logMsg("OTA: no WiFi");
-    }
-
-    // Only reached if checkAndPerformOTA() returned without rebooting
-    // (no update available, or a failure) — restore the normal screen.
-    delay(1500);
-    displayMode = MODE_TEMP;
-    enterTempScreen();
-    lastTempUpdate = millis();
-  }
-
-  if (!buttonDown && buttonWasDown && !longPressFired) {
-    // Released before the OTA threshold -> treat as a normal short press
-    if (millis() - lastButtonPress > BUTTON_DEBOUNCE_MS) {
-      lastButtonPress = millis();
-      Serial.println("\n[BUTTON PRESSED]");
-
-      if (isWiFiConnected()) {
-        captureAndSendPhoto();
-      } else {
-        Serial.println("WiFi not connected!");
-        blinkLED(5, 100);
+    if (!wasFired) {
+      if (elapsed >= BUTTON_OTA_MS && elapsed < BUTTON_FACTORY_MS) {
+        // Long press wins over any pending click classification.
+        pendingSingleClick = false;
+        runOTAFlow();
+      } else if (elapsed >= 40) {
+        // Short release: either the second half of a double-click, or
+        // the first half of a possible one. Rate-limit against bounce.
+        if (millis() - lastReleaseAction > BUTTON_DEBOUNCE_MS) {
+          lastReleaseAction = millis();
+          if (pendingSingleClick &&
+              millis() - pendingSingleClickAt < DOUBLE_CLICK_MS) {
+            // Second click within the window — double click.
+            pendingSingleClick = false;
+            Serial.println("[DOUBLE CLICK -> PHOTO]");
+            markEvent();
+            updateDashboard();
+            lastDashboardUpdate = millis();
+            if (isWiFiConnected()) {
+              captureAndSendPhoto();
+            } else {
+              Serial.println("Photo skipped (no WiFi)");
+              blinkLED(5, 100);
+            }
+          } else {
+            // First click — arm/disarm decision is deferred until the
+            // double-click window elapses (see top of loop).
+            pendingSingleClick   = true;
+            pendingSingleClickAt = millis();
+          }
+        }
       }
-
-      showPicTaken();
-      displayMode = MODE_PIC;
-      picMessageStart = millis();
     }
+
+    // Only redraw the dashboard if we actually painted the hold-progress
+    // screen over it. A tap under 3s never touched the OLED, so redrawing
+    // would just cause a visible flash.
+    if (holdProgressShown) {
+      displayMode = MODE_DASHBOARD;
+      enterDashboard();
+      lastDashboardUpdate = millis();
+    }
+    holdProgressShown = false;
   }
 
   buttonWasDown = buttonDown;
 
-  if (displayMode == MODE_PIC) {
-    if (millis() - picMessageStart > PIC_MESSAGE_DURATION_MS) {
-      displayMode = MODE_TEMP;
-      enterTempScreen();
-      lastTempUpdate = millis();
-    }
-  } else if (displayMode == MODE_TEMP) {
-    if (millis() - lastTempUpdate > TEMP_UPDATE_INTERVAL_MS) {
-      updateTempValue();
-      lastTempUpdate = millis();
+  // ------- confirm pending single click after the double-click window -------
+  if (pendingSingleClick && millis() - pendingSingleClickAt > DOUBLE_CLICK_MS) {
+    pendingSingleClick = false;
+    toggleArmed();
+    Serial.printf("[ARMED = %s]\n", isArmed() ? "yes" : "no");
+    blinkLED(1, 100);
+  }
+
+  // ------- Telegram command polling -------
+  if (isWiFiConnected() && millis() - lastCommandPoll > COMMAND_POLL_INTERVAL_MS) {
+    lastCommandPoll = millis();
+    String cmd;
+    if (pollCommand(cmd)) {
+      handleTelegramCommand(cmd);
     }
   }
 
-  delay(50);
+  // ------- display refresh -------
+  if (displayMode == MODE_DASHBOARD &&
+      millis() - lastDashboardUpdate > DASHBOARD_UPDATE_INTERVAL) {
+    updateDashboard();
+    lastDashboardUpdate = millis();
+  }
+
+  delay(LOOP_TICK_MS);
 }
